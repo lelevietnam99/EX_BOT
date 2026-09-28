@@ -102,6 +102,12 @@ def load_and_process_data():
     vector_store.save_local(index_path)
     return vector_store
 
+# Chạy hàm tải dữ liệu
+vector_store = load_and_process_data()
+
+if vector_store is None:
+    st.warning("Chưa có dữ liệu bài giảng. Bạn hãy tải các file .txt vào thư mục 'data/' nhé.")
+    st.stop()
 
 # 3. CÁC NHÀ CUNG CẤP AI MIỄN PHÍ
 # Các model Gemini có gói miễn phí, xếp theo thứ tự ưu tiên (hạn mức free cao nhất lên trước).
@@ -216,7 +222,7 @@ def get_conversational_chain(model):
     prompt_template = """
     Bạn là một trợ lý ảo hỗ trợ Phật tử, được tạo ra để trả lời câu hỏi dựa trên các bài giảng của Quý Thầy.
     Hãy trả lời bằng tiếng Việt, với giọng điệu từ bi, hòa ái, tôn trọng và dễ hiểu.
-    Chỉ sử dụng thông tin trong phần "Ngữ cảnh (Context)" được cung cấp dưới đây để trả lời. 
+    Chỉ sử dụng thông tin trong phần "Ngữ cảnh (Context)" được cung cấp dưới đây để trả lời.
     Nếu câu hỏi nằm ngoài ngữ cảnh bài giảng, hãy nhẹ nhàng nói rằng: "Dạ, trong phạm vi bài giảng hiện tại, Thầy chưa đề cập chi tiết đến vấn đề này. Mong bạn hoan hỷ đặt câu hỏi khác có liên quan ạ."
     Tuyệt đối không tự bịa ra kiến thức ngoài.
 
@@ -319,6 +325,6 @@ if user_question:
                 st.stop()
             st.markdown(answer)
             st.caption(f"Trả lời bởi: {used_model}")
-    
+
     # Lưu câu trả lời vào lịch sử
     st.session_state.messages.append({"role": "assistant", "content": answer})
