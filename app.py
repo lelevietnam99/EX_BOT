@@ -7,6 +7,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.exceptions import ModelRateLimitError
 
 # 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
@@ -97,7 +98,12 @@ if user_question:
     with st.chat_message("assistant"):
         with st.spinner("Đang tìm ý trong bài giảng..."):
             context = "\n\n".join(doc.page_content for doc in docs)
-            answer = chain.invoke({"context": context, "question": user_question})
+            try:
+                answer = chain.invoke({"context": context, "question": user_question})
+            except ModelRateLimitError:
+                # Lỗi 429: API key đã hết lượt gọi (quota) của Google Gemini
+                st.error("Dạ, hiện hệ thống đang quá tải hoặc đã hết lượt hỏi trong hôm nay. Mong bạn hoan hỷ đợi ít phút rồi hỏi lại ạ.")
+                st.stop()
             st.markdown(answer)
     
     # Lưu câu trả lời vào lịch sử
