@@ -1,11 +1,11 @@
 import streamlit as st
 import os
+import re
 import glob
 import time
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.exceptions import (
@@ -15,6 +15,7 @@ from langchain_core.exceptions import (
     ModelInvalidRequestError,
 )
 from google import genai
+from rank_bm25 import BM25Okapi
 
 # 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
@@ -26,8 +27,25 @@ st.write("Hãy đặt câu hỏi, tôi sẽ trả lời dựa trên các bài gi
 api_key = st.secrets["GOOGLE_API_KEY"]
 os.environ["GOOGLE_API_KEY"] = api_key
 
-# 2. HÀM ĐỌC DỮ LIỆU VÀ TẠO BỘ NHỚ VECTOR (Dùng cache để không load lại nhiều lần)
-@st.cache_resource(show_spinner=True)
+# 2. ĐỌC BÀI GIẢNG VÀ TẠO BỘ TÌM KIẾM
+# Tìm đoạn bài giảng liên quan bằng từ khóa (thuật toán BM25), chạy ngay trên máy chủ:
+# không cần gọi API, không tốn lượt miễn phí, khởi động gần như tức thì.
+def tokenize(text):
+    """Tách câu thành các từ, thêm cả cặp 2 từ liền nhau vì tiếng Việt có nhiều từ ghép (từ bi, thiền định...)."""
+    words = re.findall(r"\w+", text.lower())
+    return words + [a + "_" + b for a, b in zip(words, words[1:])]
+
+class LectureSearch:
+    def __init__(self, docs):
+        self.docs = docs
+        self.bm25 = BM25Okapi([tokenize(doc.page_content) for doc in docs])
+
+    def search(self, question, k=5):
+        scores = self.bm25.get_scores(tokenize(question))
+        best = sorted(range(len(self.docs)), key=lambda i: scores[i], reverse=True)[:k]
+        return [self.docs[i] for i in best]
+
+@st.cache_resource(show_spinner="Đang đọc bài giảng...")
 def load_and_process_data():
     documents = []
     # Quét tất cả các file .txt trong thư mục data/
@@ -44,16 +62,12 @@ def load_and_process_data():
     # Băm nhỏ văn bản (mỗi đoạn 1000 ký tự) để AI dễ đọc hơn
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = text_splitter.split_documents(documents)
-    
-    # Biến văn bản thành Vector và lưu vào FAISS cục bộ
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    vector_store = FAISS.from_documents(docs, embeddings)
-    return vector_store
+    return LectureSearch(docs)
 
 # Chạy hàm tải dữ liệu
-vector_store = load_and_process_data()
+lecture_search = load_and_process_data()
 
-if vector_store is None:
+if lecture_search is None:
     st.warning("Chưa có dữ liệu bài giảng. Bạn hãy tải các file .txt vào thư mục 'data/' nhé.")
     st.stop()
 
@@ -130,7 +144,7 @@ def get_conversational_chain(model_name):
 # Ghi nhớ câu trả lời: cùng một câu hỏi được hỏi lại sẽ không tốn thêm lượt gọi API
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def answer_question(question, model_order):
-    docs = vector_store.similarity_search(question, k=4) # Lấy 4 đoạn liên quan nhất
+    docs = lecture_search.search(question, k=5) # Lấy 5 đoạn liên quan nhất
     context = "\n\n".join(doc.page_content for doc in docs)
 
     skipped = exhausted_models()
