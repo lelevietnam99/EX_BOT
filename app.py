@@ -5,8 +5,8 @@ from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 # 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
@@ -38,7 +38,7 @@ def load_and_process_data():
     docs = text_splitter.split_documents(documents)
     
     # Biến văn bản thành Vector và lưu vào FAISS cục bộ
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
     vector_store = FAISS.from_documents(docs, embeddings)
     return vector_store
 
@@ -64,9 +64,9 @@ def get_conversational_chain():
 
     Câu trả lời:
     """
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
+    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    chain = prompt | model | StrOutputParser()
     return chain
 
 # 4. GIAO DIỆN CHATBOT (LƯU LỊCH SỬ CHAT)
@@ -96,8 +96,8 @@ if user_question:
     
     with st.chat_message("assistant"):
         with st.spinner("Đang tìm ý trong bài giảng..."):
-            response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-            answer = response["output_text"]
+            context = "\n\n".join(doc.page_content for doc in docs)
+            answer = chain.invoke({"context": context, "question": user_question})
             st.markdown(answer)
     
     # Lưu câu trả lời vào lịch sử
