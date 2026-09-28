@@ -3,8 +3,8 @@ import os
 import re
 import glob
 import time
-from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
@@ -54,8 +54,8 @@ def load_and_process_data():
     # Đọc nội dung từng file
     documents = []
     for file_path in text_files:
-        loader = TextLoader(file_path, encoding='utf-8')
-        documents.extend(loader.load())
+        with open(file_path, encoding="utf-8") as f:
+            documents.append(Document(page_content=f.read(), metadata={"source": file_path}))
         
     # Băm nhỏ văn bản (mỗi đoạn 1000 ký tự) để AI dễ đọc hơn
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
