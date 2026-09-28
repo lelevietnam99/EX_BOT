@@ -3,18 +3,16 @@ import os
 import re
 import glob
 import time
-import hashlib
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.exceptions import ModelRateLimitError
-from langchain_core.embeddings import Embeddings
 from google import genai
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
 
 # 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
@@ -23,69 +21,35 @@ st.write("Hãy đặt câu hỏi, tôi sẽ trả lời dựa trên các bài gi
 
 # Lấy API Key từ phần cài đặt bảo mật của Streamlit (Secrets)
 # LƯU Ý: Không bao giờ dán trực tiếp API key vào code để tránh bị lộ.
-# GOOGLE_API_KEY là bắt buộc (dùng để đọc bài giảng). Các key khác không bắt buộc, có key nào thì dùng thêm nhà cung cấp đó.
+# GOOGLE_API_KEY là bắt buộc. Các key khác không bắt buộc, có key nào thì dùng thêm nhà cung cấp đó.
 api_key = st.secrets["GOOGLE_API_KEY"]
 os.environ["GOOGLE_API_KEY"] = api_key
 
-# 2. HÀM ĐỌC DỮ LIỆU VÀ TẠO BỘ NHỚ VECTOR (Dùng cache để không load lại nhiều lần)
-EMBEDDING_MODEL = "models/gemini-embedding-001"
-INDEX_DIR = "faiss_index"
+# 2. ĐỌC BÀI GIẢNG VÀ TẠO BỘ TÌM KIẾM
+# Tìm đoạn bài giảng liên quan bằng từ khóa (thuật toán BM25), chạy ngay trên máy chủ:
+# không cần gọi API, không tốn lượt miễn phí, khởi động gần như tức thì.
+def tokenize(text):
+    """Tách câu thành các từ, thêm cả cặp 2 từ liền nhau vì tiếng Việt có nhiều từ ghép (từ bi, thiền định...)."""
+    words = re.findall(r"\w+", text.lower())
+    return words + [a + "_" + b for a, b in zip(words, words[1:])]
 
-class SlowEmbeddings(Embeddings):
-    """Gói miễn phí của Google chỉ cho khoảng 100 đoạn văn/phút.
-    Lớp này gửi từng nhóm nhỏ, gặp lỗi hết lượt (429) thì chờ đúng thời gian Google yêu cầu rồi gửi tiếp."""
+class LectureSearch:
+    def __init__(self, docs):
+        self.docs = docs
+        self.bm25 = BM25Okapi([tokenize(doc.page_content) for doc in docs])
 
-    def __init__(self, batch_size=50, max_wait_rounds=20):
-        self.base = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-        self.batch_size = batch_size
-        self.max_wait_rounds = max_wait_rounds
+    def search(self, question, k=5):
+        scores = self.bm25.get_scores(tokenize(question))
+        best = sorted(range(len(self.docs)), key=lambda i: scores[i], reverse=True)[:k]
+        return [self.docs[i] for i in best]
 
-    def _with_retry(self, func, *args):
-        for _ in range(self.max_wait_rounds):
-            try:
-                return func(*args)
-            except Exception as e:
-                message = str(e)
-                if "RESOURCE_EXHAUSTED" not in message and "429" not in message:
-                    raise
-                # Google cho biết cần chờ bao lâu (ví dụ "retry in 32.4s"), không có thì chờ 60 giây
-                wait = re.search(r"retry in ([\d.]+)s", message)
-                time.sleep(float(wait.group(1)) + 1 if wait else 60)
-        return func(*args)
-
-    def embed_documents(self, texts):
-        vectors = []
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i : i + self.batch_size]
-            vectors += self._with_retry(self.base.embed_documents, batch)
-        return vectors
-
-    def embed_query(self, text):
-        return self._with_retry(self.base.embed_query, text)
-
-def data_fingerprint(text_files):
-    """Mã nhận dạng nội dung các file bài giảng: file đổi thì mã đổi, khi đó mới đọc lại."""
-    h = hashlib.sha256(EMBEDDING_MODEL.encode())
-    for file_path in sorted(text_files):
-        h.update(file_path.encode())
-        with open(file_path, "rb") as f:
-            h.update(f.read())
-    return h.hexdigest()[:16]
-
-@st.cache_resource(show_spinner="Đang đọc bài giảng lần đầu, có thể mất vài phút...")
+@st.cache_resource(show_spinner="Đang đọc bài giảng...")
 def load_and_process_data():
     # Quét tất cả các file .txt trong thư mục data/
     text_files = glob.glob("data/*.txt")
     
     if not text_files:
         return None
-
-    embeddings = SlowEmbeddings()
-
-    # Nếu đã có bộ nhớ vector lưu sẵn cho đúng các file này thì dùng lại, không tốn lượt gọi Google
-    index_path = os.path.join(INDEX_DIR, data_fingerprint(text_files))
-    if os.path.exists(index_path):
-        return FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
 
     # Đọc nội dung từng file
     documents = []
@@ -96,16 +60,12 @@ def load_and_process_data():
     # Băm nhỏ văn bản (mỗi đoạn 1000 ký tự) để AI dễ đọc hơn
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = text_splitter.split_documents(documents)
-    
-    # Biến văn bản thành Vector và lưu vào FAISS, đồng thời lưu ra ổ đĩa để lần sau dùng lại
-    vector_store = FAISS.from_documents(docs, embeddings)
-    vector_store.save_local(index_path)
-    return vector_store
+    return LectureSearch(docs)
 
 # Chạy hàm tải dữ liệu
-vector_store = load_and_process_data()
+lecture_search = load_and_process_data()
 
-if vector_store is None:
+if lecture_search is None:
     st.warning("Chưa có dữ liệu bài giảng. Bạn hãy tải các file .txt vào thư mục 'data/' nhé.")
     st.stop()
 
@@ -251,7 +211,7 @@ def get_conversational_chain(model):
 # Ghi nhớ câu trả lời: cùng một câu hỏi được hỏi lại sẽ không tốn thêm lượt gọi API
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def answer_question(question, model_order):
-    docs = vector_store.similarity_search(question, k=4) # Lấy 4 đoạn liên quan nhất
+    docs = lecture_search.search(question, k=5) # Lấy 5 đoạn liên quan nhất
     context = "\n\n".join(doc.page_content for doc in docs)
 
     skipped = failed_models()

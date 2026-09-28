@@ -4,5 +4,5 @@ langchain-core
 langchain-community
 langchain-google-genai
 langchain-text-splitters
-faiss-cpu
+rank_bm25
 langchain-openai
