@@ -3,6 +3,7 @@ import os
 import re
 import glob
 import time
+import hashlib
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -11,6 +12,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.exceptions import ModelRateLimitError
+from langchain_core.embeddings import Embeddings
 from google import genai
 from openai import OpenAI
 
@@ -26,16 +28,67 @@ api_key = st.secrets["GOOGLE_API_KEY"]
 os.environ["GOOGLE_API_KEY"] = api_key
 
 # 2. HÀM ĐỌC DỮ LIỆU VÀ TẠO BỘ NHỚ VECTOR (Dùng cache để không load lại nhiều lần)
-@st.cache_resource(show_spinner=True)
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+INDEX_DIR = "faiss_index"
+
+class SlowEmbeddings(Embeddings):
+    """Gói miễn phí của Google chỉ cho khoảng 100 đoạn văn/phút.
+    Lớp này gửi từng nhóm nhỏ, gặp lỗi hết lượt (429) thì chờ đúng thời gian Google yêu cầu rồi gửi tiếp."""
+
+    def __init__(self, batch_size=50, max_wait_rounds=20):
+        self.base = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+        self.batch_size = batch_size
+        self.max_wait_rounds = max_wait_rounds
+
+    def _with_retry(self, func, *args):
+        for _ in range(self.max_wait_rounds):
+            try:
+                return func(*args)
+            except Exception as e:
+                message = str(e)
+                if "RESOURCE_EXHAUSTED" not in message and "429" not in message:
+                    raise
+                # Google cho biết cần chờ bao lâu (ví dụ "retry in 32.4s"), không có thì chờ 60 giây
+                wait = re.search(r"retry in ([\d.]+)s", message)
+                time.sleep(float(wait.group(1)) + 1 if wait else 60)
+        return func(*args)
+
+    def embed_documents(self, texts):
+        vectors = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+            vectors += self._with_retry(self.base.embed_documents, batch)
+        return vectors
+
+    def embed_query(self, text):
+        return self._with_retry(self.base.embed_query, text)
+
+def data_fingerprint(text_files):
+    """Mã nhận dạng nội dung các file bài giảng: file đổi thì mã đổi, khi đó mới đọc lại."""
+    h = hashlib.sha256(EMBEDDING_MODEL.encode())
+    for file_path in sorted(text_files):
+        h.update(file_path.encode())
+        with open(file_path, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()[:16]
+
+@st.cache_resource(show_spinner="Đang đọc bài giảng lần đầu, có thể mất vài phút...")
 def load_and_process_data():
-    documents = []
     # Quét tất cả các file .txt trong thư mục data/
     text_files = glob.glob("data/*.txt")
     
     if not text_files:
         return None
 
+    embeddings = SlowEmbeddings()
+
+    # Nếu đã có bộ nhớ vector lưu sẵn cho đúng các file này thì dùng lại, không tốn lượt gọi Google
+    index_path = os.path.join(INDEX_DIR, data_fingerprint(text_files))
+    if os.path.exists(index_path):
+        return FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+
     # Đọc nội dung từng file
+    documents = []
     for file_path in text_files:
         loader = TextLoader(file_path, encoding='utf-8')
         documents.extend(loader.load())
@@ -44,17 +97,11 @@ def load_and_process_data():
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = text_splitter.split_documents(documents)
     
-    # Biến văn bản thành Vector và lưu vào FAISS cục bộ
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+    # Biến văn bản thành Vector và lưu vào FAISS, đồng thời lưu ra ổ đĩa để lần sau dùng lại
     vector_store = FAISS.from_documents(docs, embeddings)
+    vector_store.save_local(index_path)
     return vector_store
 
-# Chạy hàm tải dữ liệu
-vector_store = load_and_process_data()
-
-if vector_store is None:
-    st.warning("Chưa có dữ liệu bài giảng. Bạn hãy tải các file .txt vào thư mục 'data/' nhé.")
-    st.stop()
 
 # 3. CÁC NHÀ CUNG CẤP AI MIỄN PHÍ
 # Các model Gemini có gói miễn phí, xếp theo thứ tự ưu tiên (hạn mức free cao nhất lên trước).
