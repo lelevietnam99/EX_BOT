@@ -10,7 +10,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 # 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
-st.title("🙏 Trợ lý hỏi đáp Bài giảng của Quý Thầy")
+st.title("🙏 HỎI - ĐÁP GIÁO LÝ")
 st.write("Hãy đặt câu hỏi, tôi sẽ trả lời dựa trên các bài giảng đã được tải lên.")
 
 # Lấy API Key từ phần cài đặt bảo mật của Streamlit (Secrets)
@@ -64,7 +64,7 @@ def get_conversational_chain():
 
     Câu trả lời:
     """
-    model = ChatGoogleGenerativeAI(model="gemini-3.8-flash", temperature=0.3)
+    model = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0.3)
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     chain = prompt | model | StrOutputParser()
     return chain
