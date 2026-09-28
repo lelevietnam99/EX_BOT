@@ -7,7 +7,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.exceptions import ModelRateLimitError
+from langchain_core.exceptions import ModelRateLimitError, ModelNotFoundError
 
 # 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
@@ -51,6 +51,9 @@ if vector_store is None:
     st.stop()
 
 # 3. HÀM TẠO CHUỖI TRẢ LỜI CÂU HỎI (PROMPT)
+# Các model Gemini có gói miễn phí, xếp theo thứ tự ưu tiên
+FREE_MODELS = ["gemini-3.1-flash-lite", "gemini-3-flash", "gemini-3.8-flash"]
+
 def get_conversational_chain():
     # Căn dặn AI cách trả lời sao cho chuẩn mực và bám sát bài giảng
     prompt_template = """
@@ -65,10 +68,25 @@ def get_conversational_chain():
 
     Câu trả lời:
     """
-    model = ChatGoogleGenerativeAI(model="gemini-3.8-flash", temperature=0.3)
+    # Danh sách model, ưu tiên model có hạn mức miễn phí cao nhất.
+    # Nếu model đầu hết lượt (429) hoặc không còn tồn tại (404) thì tự chuyển sang model kế tiếp.
+    models = [
+        ChatGoogleGenerativeAI(model=name, temperature=0.3, max_retries=1)
+        for name in FREE_MODELS
+    ]
+    model = models[0].with_fallbacks(
+        models[1:], exceptions_to_handle=(ModelRateLimitError, ModelNotFoundError)
+    )
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     chain = prompt | model | StrOutputParser()
     return chain
+
+# Ghi nhớ câu trả lời: cùng một câu hỏi được hỏi lại sẽ không tốn thêm lượt gọi API
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def answer_question(question):
+    docs = vector_store.similarity_search(question, k=4) # Lấy 4 đoạn liên quan nhất
+    context = "\n\n".join(doc.page_content for doc in docs)
+    return get_conversational_chain().invoke({"context": context, "question": question})
 
 # 4. GIAO DIỆN CHATBOT (LƯU LỊCH SỬ CHAT)
 # Khởi tạo lịch sử chat nếu chưa có
@@ -89,17 +107,11 @@ if user_question:
     with st.chat_message("user"):
         st.markdown(user_question)
 
-    # Tìm kiếm các đoạn văn bản trong thư mục data/ giống với câu hỏi nhất
-    docs = vector_store.similarity_search(user_question, k=4) # Lấy 4 đoạn liên quan nhất
-    
-    # Đưa các đoạn văn bản đó cho AI xử lý và sinh ra câu trả lời
-    chain = get_conversational_chain()
-    
+    # Tìm các đoạn bài giảng liên quan và đưa cho AI sinh ra câu trả lời
     with st.chat_message("assistant"):
         with st.spinner("Đang tìm ý trong bài giảng..."):
-            context = "\n\n".join(doc.page_content for doc in docs)
             try:
-                answer = chain.invoke({"context": context, "question": user_question})
+                answer = answer_question(user_question.strip())
             except ModelRateLimitError:
                 # Lỗi 429: API key đã hết lượt gọi (quota) của Google Gemini
                 st.error("Dạ, hiện hệ thống đang quá tải hoặc đã hết lượt hỏi trong hôm nay. Mong bạn hoan hỷ đợi ít phút rồi hỏi lại ạ.")
