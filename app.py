@@ -1,104 +1,135 @@
-import streamlit as st
-import os
 import glob
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+import os
 
-# 1. CẤU HÌNH TRANG GIAO DIỆN STREAMLIT
+import numpy as np
+import streamlit as st
+from google import genai
+from google.genai import types
+
+EMBED_MODEL = "gemini-embedding-001"
+CHAT_MODEL = st.secrets.get("CHAT_MODEL", "gemini-3.5-flash")  # có thể đổi trong Secrets
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+TOP_K = 4
+
 st.set_page_config(page_title="Chatbot Bài Giảng", page_icon="🙏", layout="centered")
 st.title("🙏 HỎI - ĐÁP GIÁO LÝ")
 st.write("Hãy đặt câu hỏi, tôi sẽ trả lời dựa trên các bài giảng đã được tải lên.")
 
-# Lấy API Key từ phần cài đặt bảo mật của Streamlit (Secrets)
-# LƯU Ý: Không bao giờ dán trực tiếp API key vào code để tránh bị lộ.
-api_key = st.secrets["GOOGLE_API_KEY"]
-os.environ["GOOGLE_API_KEY"] = api_key
-
-# 2. HÀM ĐỌC DỮ LIỆU VÀ TẠO BỘ NHỚ VECTOR (Dùng cache để không load lại nhiều lần)
-@st.cache_resource(show_spinner=True)
-def load_and_process_data():
-    documents = []
-    # Quét tất cả các file .txt trong thư mục data/
-    text_files = glob.glob("data/*.txt")
-    
-    if not text_files:
-        return None
-
-    # Đọc nội dung từng file
-    for file_path in text_files:
-        loader = TextLoader(file_path, encoding='utf-8')
-        documents.extend(loader.load())
-        
-    # Băm nhỏ văn bản (mỗi đoạn 1000 ký tự) để AI dễ đọc hơn
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    docs = text_splitter.split_documents(documents)
-    
-    # Biến văn bản thành Vector và lưu vào FAISS cục bộ
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    vector_store = FAISS.from_documents(docs, embeddings)
-    return vector_store
-
-# Chạy hàm tải dữ liệu
-vector_store = load_and_process_data()
-
-if vector_store is None:
-    st.warning("Chưa có dữ liệu bài giảng. Bạn hãy tải các file .txt vào thư mục 'data/' nhé.")
+# API key lấy từ Streamlit Secrets (không ghi trực tiếp vào code)
+if "GOOGLE_API_KEY" not in st.secrets:
+    st.error("Chưa cấu hình GOOGLE_API_KEY trong Settings → Secrets.")
     st.stop()
 
-# 3. HÀM TẠO CHUỖI TRẢ LỜI CÂU HỎI (PROMPT)
-def get_conversational_chain():
-    # Căn dặn AI cách trả lời sao cho chuẩn mực và bám sát bài giảng
-    prompt_template = """
-    Bạn là một trợ lý ảo hỗ trợ Phật tử, được tạo ra để trả lời câu hỏi dựa trên các bài giảng của Quý Thầy.
-    Hãy trả lời bằng giọng điệu từ bi, hòa ái, tôn trọng và dễ hiểu.
-    Chỉ sử dụng thông tin trong phần "Ngữ cảnh (Context)" được cung cấp dưới đây để trả lời. 
-    Nếu câu hỏi nằm ngoài ngữ cảnh bài giảng, hãy nhẹ nhàng nói rằng: "Dạ, trong phạm vi bài giảng hiện tại, Thầy chưa đề cập chi tiết đến vấn đề này. Mong bạn hoan hỷ đặt câu hỏi khác có liên quan ạ."
-    Tuyệt đối không tự bịa ra kiến thức ngoài.
+client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 
-    Ngữ cảnh (Context):\n {context}?\n
-    Câu hỏi:\n {question}\n
 
-    Câu trả lời:
-    """
-    model = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = prompt | model | StrOutputParser()
-    return chain
+def split_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Cắt văn bản thành các đoạn ~size ký tự, ưu tiên ngắt ở xuống dòng/khoảng trắng."""
+    chunks, start, n = [], 0, len(text)
+    while start < n:
+        end = min(start + size, n)
+        if end < n:
+            cut = max(text.rfind("\n", start, end), text.rfind(" ", start, end))
+            if cut > start + size // 2:
+                end = cut
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
 
-# 4. GIAO DIỆN CHATBOT (LƯU LỊCH SỬ CHAT)
-# Khởi tạo lịch sử chat nếu chưa có
+
+def embed_texts(texts, task_type):
+    """Tạo embedding theo lô (tối đa 100 đoạn / lần gọi)."""
+    vectors = []
+    for i in range(0, len(texts), 100):
+        result = client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=texts[i : i + 100],
+            config=types.EmbedContentConfig(task_type=task_type),
+        )
+        vectors.extend(e.values for e in result.embeddings)
+    arr = np.array(vectors, dtype=np.float32)
+    return arr / np.linalg.norm(arr, axis=1, keepdims=True)  # chuẩn hóa để dùng tích vô hướng
+
+
+@st.cache_resource(show_spinner="Đang đọc bài giảng và tạo chỉ mục...")
+def load_index():
+    files = sorted(glob.glob("data/*.txt"))
+    if not files:
+        return None
+    chunks = []
+    for path in files:
+        with open(path, encoding="utf-8") as f:
+            chunks.extend(split_text(f.read()))
+    return chunks, embed_texts(chunks, "RETRIEVAL_DOCUMENT")
+
+
+try:
+    index = load_index()
+except Exception as e:
+    st.error(f"Không tạo được chỉ mục từ Gemini API: {e}")
+    st.info(
+        "Nếu lỗi là 403 SERVICE_DISABLED: hãy tạo key tại https://aistudio.google.com/apikey "
+        "(hoặc bật 'Generative Language API' cho project của key), rồi cập nhật Secrets và Reboot app."
+    )
+    st.stop()
+
+if index is None:
+    st.warning("Chưa có dữ liệu bài giảng. Hãy đặt các file .txt vào thư mục 'data/'.")
+    st.stop()
+
+chunks, chunk_vectors = index
+
+PROMPT = """Bạn là một trợ lý ảo hỗ trợ Phật tử, được tạo ra để trả lời câu hỏi dựa trên các bài giảng của Quý Thầy.
+Hãy trả lời bằng giọng điệu từ bi, hòa ái, tôn trọng và dễ hiểu.
+Chỉ sử dụng thông tin trong phần "Ngữ cảnh" dưới đây để trả lời.
+Nếu câu hỏi nằm ngoài ngữ cảnh bài giảng, hãy nhẹ nhàng nói rằng: "Dạ, trong phạm vi bài giảng hiện tại, Thầy chưa đề cập chi tiết đến vấn đề này. Mong bạn hoan hỷ đặt câu hỏi khác có liên quan ạ."
+Tuyệt đối không tự bịa ra kiến thức ngoài.
+
+Ngữ cảnh:
+{context}
+
+Câu hỏi:
+{question}
+
+Câu trả lời:"""
+
+
+def answer_question(question):
+    q_vec = embed_texts([question], "RETRIEVAL_QUERY")[0]
+    top = np.argsort(chunk_vectors @ q_vec)[::-1][:TOP_K]
+    context = "\n\n".join(chunks[i] for i in top)
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=PROMPT.format(context=context, question=question),
+        config=types.GenerateContentConfig(temperature=0.3),
+    )
+    return response.text or "Dạ, hiện chưa có câu trả lời. Mong bạn thử lại ạ."
+
+
+# Lịch sử chat
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Hiển thị lại các tin nhắn cũ
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-# Ô nhập tin nhắn của người dùng
-user_question = st.chat_input("Nhập câu hỏi của bạn (ví dụ: Thầy dạy thế nào về lòng từ bi?)")
-
-if user_question:
-    # In câu hỏi của người dùng ra màn hình
-    st.session_state.messages.append({"role": "user", "content": user_question})
+question = st.chat_input("Nhập câu hỏi của bạn (ví dụ: Thầy dạy thế nào về lòng từ bi?)")
+if question:
+    st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
-        st.markdown(user_question)
+        st.markdown(question)
 
-    # Tìm kiếm các đoạn văn bản trong thư mục data/ giống với câu hỏi nhất
-    docs = vector_store.similarity_search(user_question, k=4) # Lấy 4 đoạn liên quan nhất
-    
-    # Đưa các đoạn văn bản đó cho AI xử lý và sinh ra câu trả lời
-    chain = get_conversational_chain()
-    
     with st.chat_message("assistant"):
         with st.spinner("Đang tìm ý trong bài giảng..."):
-            context = "\n\n".join(doc.page_content for doc in docs)
-            answer = chain.invoke({"context": context, "question": user_question})
-            st.markdown(answer)
-    
-    # Lưu câu trả lời vào lịch sử
+            try:
+                answer = answer_question(question)
+            except Exception as e:
+                answer = f"Xin lỗi, đã có lỗi khi gọi Gemini API: {e}"
+        st.markdown(answer)
     st.session_state.messages.append({"role": "assistant", "content": answer})
