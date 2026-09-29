@@ -64,7 +64,7 @@ def get_conversational_chain():
 
     Câu trả lời:
     """
-    model = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0.3)
+    model = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0.3)
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     chain = prompt | model | StrOutputParser()
     return chain
